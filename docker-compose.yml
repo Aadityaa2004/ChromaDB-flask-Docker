@@ -1,0 +1,34 @@
+services:
+  chroma_server:
+    image: chromadb/chroma:latest
+    volumes:
+      - chroma_data:/chroma/chroma
+    ports:
+      - "8000:8000"
+    networks:
+      - chroma_net
+
+  flask_app:
+    build: .
+    ports:
+      - "5001:5000"
+    volumes:
+      - ./:/app
+    depends_on:
+      - chroma_server
+    environment:
+      - CHROMA_HOST=chroma_server
+      - CHROMA_PORT=8000
+      - FLASK_APP=app.py
+      - FLASK_ENV=development
+    networks:
+      - chroma_net
+    restart: on-failure
+
+networks:
+  chroma_net:
+    driver: bridge
+
+volumes:
+  chroma_data:
+    driver: local

@@ -1,0 +1,7 @@
+flask==2.3.3
+werkzeug==2.3.7
+pandas
+chromadb
+sentence-transformers
+python-dotenv
+requests
