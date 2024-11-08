@@ -4,6 +4,12 @@ from flask import Flask, request, jsonify
 from chromadb.utils import embedding_functions
 import os
 import time
+import random
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
@@ -61,6 +67,39 @@ def create_collection():
     except Exception as e:
         print(f"Error creating collection: {str(e)}")
         raise
+
+# Initialize ChromaDB client
+def init_chroma():
+    """Initialize ChromaDB client with error handling"""
+    try:
+        client = chromadb.HttpClient(
+            host=os.getenv("CHROMA_HOST", "localhost"),
+            port=int(os.getenv("CHROMA_PORT", 8000))
+        )
+        client.heartbeat()
+        logger.info("Successfully connected to ChromaDB")
+        return client
+    except Exception as e:
+        logger.error(f"Failed to initialize ChromaDB: {str(e)}")
+        raise
+
+# Initialize embedding function
+def init_embedding():
+    """Initialize embedding function with error handling"""
+    try:
+        return embedding_functions.SentenceTransformerEmbeddingFunction(
+            model_name=MODEL_NAME
+        )
+    except Exception as e:
+        logger.error(f"Failed to initialize embedding function: {str(e)}")
+        raise
+
+try:
+    client = init_chroma()
+    embedding_function = init_embedding()
+except Exception as e:
+    logger.error(f"Initialization failed: {str(e)}")
+    raise
 
 @app.route('/')
 def health_check():
@@ -232,6 +271,220 @@ def delete_user(user_id):
             "error": str(e),
             "status": "error"
         }), 500
+    
+@app.route('/select-user/<user_id>', methods=['GET'])
+def select_user(user_id):
+    """Get a specific user's profile for search context"""
+    try:
+        collection = client.get_collection(name=COLLECTION_NAME)
+        results = collection.get(
+            ids=[user_id],
+            include=['metadatas', 'documents']
+        )
+        
+        if not results['ids']:
+            return jsonify({
+                "error": "User not found",
+                "status": "error"
+            }), 404
+            
+        return jsonify({
+            "user_profile": results['metadatas'][0],
+            "status": "success"
+        }), 200
+        
+    except Exception as e:
+        return jsonify({
+            "error": str(e),
+            "status": "error"
+        }), 500
+    
+@app.route('/dynamic-search', methods=['POST'])
+def dynamic_search():
+    """Dynamic search based on search type and user context"""
+    try:
+        data = request.json
+        query_text = data.get('query', '')
+        search_type = data.get('search_type', 'general')  # name, skills, tags, about, general
+        context_user_id = data.get('context_user_id')  # ID of the user performing the search
+        n_results = data.get('top_k', 5)
+        
+        collection = client.get_collection(name=COLLECTION_NAME)
+        
+        # Get context user's profile if provided
+        context_user_profile = None
+        if context_user_id:
+            context_results = collection.get(
+                ids=[context_user_id],
+                include=['metadatas']
+            )
+            if context_results['metadatas']:
+                context_user_profile = context_results['metadatas'][0]
+        
+        # Adjust search based on type
+        if search_type == 'name':
+            # Exact name matching
+            results = collection.query(
+                query_texts=[query_text],
+                n_results=100  # Get more results initially for filtering
+            )
+            
+            # Filter results for exact name matches
+            filtered_results = []
+            for i in range(len(results['ids'][0])):
+                metadata = results['metadatas'][0][i]
+                full_name = f"{metadata['first_name']} {metadata['middle_name']} {metadata['last_name']}".lower()
+                if query_text.lower() in full_name:
+                    filtered_results.append({
+                        "id": results['ids'][0][i],
+                        "metadata": metadata,
+                        "distance": results['distances'][0][i] if 'distances' in results else None
+                    })
+            
+            return jsonify({
+                "results": filtered_results[:n_results],
+                "status": "success"
+            }), 200
+            
+        elif search_type in ['skills', 'tags', 'about']:
+            # Enhanced search using context user's profile
+            enhanced_query = query_text
+            if context_user_profile:
+                # Combine search query with relevant context from user's profile
+                if search_type == 'skills':
+                    enhanced_query = f"{query_text} {context_user_profile.get('skills', '')}"
+                elif search_type == 'tags':
+                    enhanced_query = f"{query_text} {context_user_profile.get('tags', '')}"
+                elif search_type == 'about':
+                    enhanced_query = f"{query_text} {context_user_profile.get('about', '')}"
+            
+            results = collection.query(
+                query_texts=[enhanced_query],
+                n_results=n_results
+            )
+            
+            # Format results
+            formatted_results = []
+            for i in range(len(results['ids'][0])):
+                if results['ids'][0][i] != context_user_id:  # Exclude the context user
+                    result = {
+                        "id": results['ids'][0][i],
+                        "metadata": results['metadatas'][0][i],
+                        "document": results['documents'][0][i],
+                        "distance": results['distances'][0][i] if 'distances' in results else None
+                    }
+                    formatted_results.append(result)
+            
+            return jsonify({
+                "results": formatted_results,
+                "status": "success"
+            }), 200
+            
+        else:  # general search
+            results = collection.query(
+                query_texts=[query_text],
+                n_results=n_results
+            )
+            
+            formatted_results = []
+            for i in range(len(results['ids'][0])):
+                result = {
+                    "id": results['ids'][0][i],
+                    "metadata": results['metadatas'][0][i],
+                    "document": results['documents'][0][i],
+                    "distance": results['distances'][0][i] if 'distances' in results else None
+                }
+                formatted_results.append(result)
+            
+            return jsonify({
+                "results": formatted_results,
+                "status": "success"
+            }), 200
+            
+    except Exception as e:
+        return jsonify({
+            "error": str(e),
+            "status": "error"
+        }), 500
+    
+@app.route('/test', methods=['GET'])
+def test():
+    """Test endpoint to verify API is working"""
+    return jsonify({"status": "API is running"}), 200
+
+@app.route('/database-stats', methods=['GET'])
+def get_database_stats():
+    """Return statistics about the database"""
+    logger.debug("Accessing database-stats endpoint")
+    try:
+        collection = client.get_collection(name=COLLECTION_NAME)
+        logger.debug(f"Retrieved collection: {COLLECTION_NAME}")
+        
+        # Get collection stats
+        all_results = collection.get()
+        total_rows = len(all_results['ids'])
+        logger.info(f"Total rows in database: {total_rows}")
+        
+        return jsonify({
+            "total_rows": total_rows,
+            "collection_name": COLLECTION_NAME,
+            "status": "success"
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Error in database-stats: {str(e)}")
+        return jsonify({
+            "error": str(e),
+            "status": "error"
+        }), 500
+
+@app.route('/random-users', methods=['GET'])
+def get_random_users():
+    """Return 10 random users from the database"""
+    logger.debug("Accessing random-users endpoint")
+    try:
+        collection = client.get_collection(name=COLLECTION_NAME)
+        
+        # Get all user IDs
+        all_results = collection.get()
+        all_ids = all_results['ids']
+        
+        # Select 10 random IDs
+        sample_size = min(10, len(all_ids))
+        random_ids = random.sample(all_ids, sample_size)
+        
+        # Get the selected users
+        results = collection.get(
+            ids=random_ids,
+            include=['metadatas', 'documents']
+        )
+        
+        formatted_results = []
+        for i in range(len(results['ids'])):
+            result = {
+                "id": results['ids'][i],
+                "metadata": results['metadatas'][i],
+                "document": results['documents'][i]
+            }
+            formatted_results.append(result)
+        
+        return jsonify({
+            "results": formatted_results,
+            "status": "success"
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Error in random-users: {str(e)}")
+        return jsonify({
+            "error": str(e),
+            "status": "error"
+        }), 500
+
 
 if __name__ == '__main__':
+    # Add debug output for registered routes
+    logger.info("Registered routes:")
+    for rule in app.url_map.iter_rules():
+        logger.info(f"{rule.endpoint}: {rule.methods} {rule}")
+    
     app.run(debug=True, host='0.0.0.0', port=5000)
