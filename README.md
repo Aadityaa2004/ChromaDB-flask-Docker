@@ -1,4 +1,6 @@
 # ChromaDB Docker Setup and API Documentation
+## Prepared by Aadityaa :))
+
 
 ## Table of Contents
 1. [API Endpoints](#api-endpoints)
